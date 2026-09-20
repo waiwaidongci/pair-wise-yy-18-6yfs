@@ -4,10 +4,12 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test": "node test/e2e.js && node test/persistence-concurrency.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "sql.js": "^1.14.2"
   },
   "name": "wxyy-14-backend-api"
 }

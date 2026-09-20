@@ -24,3 +24,6 @@ coverage/
 # Editor folders
 .vscode/
 .idea/
+
+# 测试临时数据库
+tmp-*-db/

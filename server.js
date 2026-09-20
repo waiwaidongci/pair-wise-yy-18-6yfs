@@ -1,51 +1,15 @@
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const { execFileSync } = require('child_process');
 const { randomUUID } = require('crypto');
 const config = require('./project.config');
+const db = require('./lib/db');
+const store = require('./lib/scheduleStore');
+const scheduleService = require('./lib/scheduleService');
+const state = require('./lib/scheduleState');
 
 const app = express();
 const PORT = process.env.PORT || config.port;
-const DATA_DIR = path.join(__dirname, 'data');
-const DB_FILE = path.join(DATA_DIR, 'app.db');
 
 app.use(express.json({ limit: '2mb' }));
-
-function sqlValue(value) {
-  if (value === null || value === undefined) return 'NULL';
-  return "'" + String(value).replaceAll("'", "''") + "'";
-}
-
-function runSql(sql) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  return execFileSync('sqlite3', [DB_FILE], {
-    input: sql,
-    encoding: 'utf8'
-  });
-}
-
-function select(sql) {
-  const output = runSql('.mode json\n' + sql);
-  if (!output.trim()) return [];
-  return JSON.parse(output);
-}
-
-function now() {
-  return new Date().toISOString();
-}
-
-function toRecord(row) {
-  const data = JSON.parse(row.data || '{}');
-  return {
-    id: row.id,
-    collection: row.collection,
-    status: row.status,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    ...data
-  };
-}
 
 function findCollection(name) {
   const collection = config.collections[name];
@@ -57,117 +21,15 @@ function findCollection(name) {
   return collection;
 }
 
-function titleFor(collectionConfig, data) {
-  return (collectionConfig.titleFields || [])
-    .map((field) => data[field])
-    .filter(Boolean)
-    .join(' / ') || data.name || data.title || data.code || '';
-}
-
 function validate(collectionConfig, data) {
-  const missing = (collectionConfig.required || []).filter((field) => data[field] === undefined || data[field] === '');
+  const missing = (collectionConfig.required || []).filter(
+    (field) => data[field] === undefined || data[field] === ''
+  );
   if (missing.length) {
     const error = new Error('missing required fields: ' + missing.join(', '));
     error.status = 400;
     throw error;
   }
-}
-
-function insertEvent({ recordId, collection, action, status, actor, note, data }) {
-  runSql(
-    'INSERT INTO events (id, record_id, collection, action, status, actor, note, data, created_at) VALUES (' +
-    [
-      sqlValue(randomUUID()),
-      sqlValue(recordId),
-      sqlValue(collection),
-      sqlValue(action || '记录'),
-      sqlValue(status || ''),
-      sqlValue(actor || ''),
-      sqlValue(note || ''),
-      sqlValue(JSON.stringify(data || {})),
-      sqlValue(now())
-    ].join(', ') +
-    ');'
-  );
-}
-
-function initDb() {
-  runSql(`
-CREATE TABLE IF NOT EXISTS records (
-  id TEXT PRIMARY KEY,
-  collection TEXT NOT NULL,
-  status TEXT NOT NULL,
-  title TEXT NOT NULL,
-  data TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_records_collection ON records(collection);
-CREATE INDEX IF NOT EXISTS idx_records_status ON records(status);
-CREATE TABLE IF NOT EXISTS events (
-  id TEXT PRIMARY KEY,
-  record_id TEXT NOT NULL,
-  collection TEXT NOT NULL,
-  action TEXT NOT NULL,
-  status TEXT,
-  actor TEXT,
-  note TEXT,
-  data TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_events_record ON events(record_id);
-`);
-
-  const count = select('SELECT COUNT(*) AS count FROM records;')[0].count;
-  if (count > 0) return;
-
-  for (const seed of config.seed || []) {
-    const collectionConfig = findCollection(seed.collection);
-    const id = seed.id || randomUUID();
-    const createdAt = seed.createdAt || now();
-    const status = seed.status || collectionConfig.defaultStatus || '';
-    const data = { ...seed.data, status };
-    runSql(
-      'INSERT INTO records (id, collection, status, title, data, created_at, updated_at) VALUES (' +
-      [
-        sqlValue(id),
-        sqlValue(seed.collection),
-        sqlValue(status),
-        sqlValue(titleFor(collectionConfig, data)),
-        sqlValue(JSON.stringify(data)),
-        sqlValue(createdAt),
-        sqlValue(seed.updatedAt || createdAt)
-      ].join(', ') +
-      ');'
-    );
-    insertEvent({
-      recordId: id,
-      collection: seed.collection,
-      action: seed.eventAction || '创建',
-      status,
-      actor: seed.actor || 'system',
-      note: seed.note || '',
-      data
-    });
-  }
-}
-
-function loadRecord(collection, id) {
-  const rows = select(
-    'SELECT * FROM records WHERE collection = ' + sqlValue(collection) + ' AND id = ' + sqlValue(id) + ' LIMIT 1;'
-  );
-  return rows[0] ? toRecord(rows[0]) : null;
-}
-
-function saveRecord(collection, id, data, status) {
-  const collectionConfig = findCollection(collection);
-  runSql(
-    'UPDATE records SET status = ' + sqlValue(status) +
-    ', title = ' + sqlValue(titleFor(collectionConfig, data)) +
-    ', data = ' + sqlValue(JSON.stringify(data)) +
-    ', updated_at = ' + sqlValue(now()) +
-    ' WHERE collection = ' + sqlValue(collection) + ' AND id = ' + sqlValue(id) + ';'
-  );
 }
 
 function applyQuery(records, query) {
@@ -186,7 +48,7 @@ function applyQuery(records, query) {
   });
 }
 
-initDb();
+/* ---------------- 通用档案入口（偶头/配件/修补/装箱/缺损） ---------------- */
 
 app.get('/health', (req, res) => {
   res.json({ ok: true, service: config.title, port: PORT });
@@ -202,11 +64,12 @@ app.get('/api/meta', (req, res) => {
 });
 
 app.get('/api/:collection', (req, res, next) => {
+  if (!config.collections[req.params.collection]) return next();
   try {
-    findCollection(req.params.collection);
-    const rows = select(
-      'SELECT * FROM records WHERE collection = ' + sqlValue(req.params.collection) + ' ORDER BY updated_at DESC;'
-    ).map(toRecord);
+    let rows = db.listRecords(req.params.collection);
+    if (req.params.collection === 'tourSchedules') {
+      rows = rows.map((r) => scheduleService.scheduleView(r));
+    }
     const filtered = applyQuery(rows, req.query);
     const limit = Number(req.query.limit || 0);
     res.json(limit > 0 ? filtered.slice(0, limit) : filtered);
@@ -216,6 +79,7 @@ app.get('/api/:collection', (req, res, next) => {
 });
 
 app.post('/api/:collection', (req, res, next) => {
+  if (!config.collections[req.params.collection]) return next();
   try {
     const collectionConfig = findCollection(req.params.collection);
     const data = { ...collectionConfig.defaults, ...req.body };
@@ -223,50 +87,38 @@ app.post('/api/:collection', (req, res, next) => {
     data.status = status;
     validate(collectionConfig, data);
     const id = randomUUID();
-    const createdAt = now();
-    runSql(
-      'INSERT INTO records (id, collection, status, title, data, created_at, updated_at) VALUES (' +
-      [
-        sqlValue(id),
-        sqlValue(req.params.collection),
-        sqlValue(status),
-        sqlValue(titleFor(collectionConfig, data)),
-        sqlValue(JSON.stringify(data)),
-        sqlValue(createdAt),
-        sqlValue(createdAt)
-      ].join(', ') +
-      ');'
-    );
-    insertEvent({
-      recordId: id,
+    db.insertRecord({
+      id,
       collection: req.params.collection,
-      action: req.body.action || '创建',
       status,
+      data,
+      createdAt: db.now(),
+      eventAction: req.body.action || '创建',
       actor: req.body.actor || '',
-      note: req.body.note || '',
-      data
+      note: req.body.note || ''
     });
-    res.status(201).json(loadRecord(req.params.collection, id));
+    db.flush();
+    res.status(201).json(db.getRecord(req.params.collection, id));
   } catch (error) {
     next(error);
   }
 });
 
 app.get('/api/:collection/:id', (req, res, next) => {
+  if (!config.collections[req.params.collection]) return next();
   try {
-    findCollection(req.params.collection);
-    const record = loadRecord(req.params.collection, req.params.id);
+    const record = db.getRecord(req.params.collection, req.params.id);
     if (!record) return res.status(404).json({ error: 'not found' });
-    res.json(record);
+    res.json(req.params.collection === 'tourSchedules' ? scheduleService.scheduleView(record) : record);
   } catch (error) {
     next(error);
   }
 });
 
 app.patch('/api/:collection/:id', (req, res, next) => {
+  if (!config.collections[req.params.collection]) return next();
   try {
-    findCollection(req.params.collection);
-    const record = loadRecord(req.params.collection, req.params.id);
+    const record = db.getRecord(req.params.collection, req.params.id);
     if (!record) return res.status(404).json({ error: 'not found' });
     const nextData = { ...record, ...req.body };
     delete nextData.id;
@@ -275,8 +127,8 @@ app.patch('/api/:collection/:id', (req, res, next) => {
     delete nextData.updatedAt;
     const status = nextData.status || record.status;
     nextData.status = status;
-    saveRecord(req.params.collection, req.params.id, nextData, status);
-    insertEvent({
+    db.updateRecord(req.params.collection, req.params.id, nextData, status);
+    db.addEvent({
       recordId: req.params.id,
       collection: req.params.collection,
       action: req.body.action || '更新',
@@ -285,16 +137,18 @@ app.patch('/api/:collection/:id', (req, res, next) => {
       note: req.body.note || '',
       data: req.body
     });
-    res.json(loadRecord(req.params.collection, req.params.id));
+    db.flush();
+    res.json(db.getRecord(req.params.collection, req.params.id));
   } catch (error) {
     next(error);
   }
 });
 
 app.post('/api/:collection/:id/events', (req, res, next) => {
+  if (!config.collections[req.params.collection]) return next();
   try {
     const collectionConfig = findCollection(req.params.collection);
-    const record = loadRecord(req.params.collection, req.params.id);
+    const record = db.getRecord(req.params.collection, req.params.id);
     if (!record) return res.status(404).json({ error: 'not found' });
     const status = req.body.status || record.status;
     if (collectionConfig.statuses && !collectionConfig.statuses.includes(status)) {
@@ -305,8 +159,8 @@ app.post('/api/:collection/:id/events', (req, res, next) => {
     delete nextData.collection;
     delete nextData.createdAt;
     delete nextData.updatedAt;
-    saveRecord(req.params.collection, req.params.id, nextData, status);
-    insertEvent({
+    db.updateRecord(req.params.collection, req.params.id, nextData, status);
+    db.addEvent({
       recordId: req.params.id,
       collection: req.params.collection,
       action: req.body.action || status || '记录',
@@ -315,40 +169,190 @@ app.post('/api/:collection/:id/events', (req, res, next) => {
       note: req.body.note || '',
       data: req.body
     });
-    res.json(loadRecord(req.params.collection, req.params.id));
+    db.flush();
+    res.json(db.getRecord(req.params.collection, req.params.id));
   } catch (error) {
     next(error);
   }
 });
 
 app.get('/api/:collection/:id/timeline', (req, res, next) => {
+  if (!config.collections[req.params.collection]) return next();
   try {
-    findCollection(req.params.collection);
-    const record = loadRecord(req.params.collection, req.params.id);
+    const record = db.getRecord(req.params.collection, req.params.id);
     if (!record) return res.status(404).json({ error: 'not found' });
-    const events = select(
-      'SELECT * FROM events WHERE record_id = ' + sqlValue(req.params.id) + ' ORDER BY created_at ASC;'
-    ).map((event) => ({
-      id: event.id,
-      action: event.action,
-      status: event.status,
-      actor: event.actor,
-      note: event.note,
-      data: JSON.parse(event.data || '{}'),
-      createdAt: event.created_at
-    }));
-    res.json({ record, events });
+    res.json({ record, events: db.getEvents(req.params.id) });
   } catch (error) {
     next(error);
   }
 });
 
 app.delete('/api/:collection/:id', (req, res, next) => {
+  if (!config.collections[req.params.collection]) return next();
   try {
-    findCollection(req.params.collection);
-    runSql('DELETE FROM records WHERE collection = ' + sqlValue(req.params.collection) + ' AND id = ' + sqlValue(req.params.id) + ';');
-    runSql('DELETE FROM events WHERE record_id = ' + sqlValue(req.params.id) + ';');
+    if (req.params.collection === 'tourSchedules') {
+      return res.status(405).json({ error: '档期不支持删除，使用闭环结束占用' });
+    }
+    db.deleteRecord(req.params.collection, req.params.id);
+    db.flush();
     res.status(204).end();
+  } catch (error) {
+    next(error);
+  }
+});
+
+/* ---------------- 巡演档期专用入口（请求层：只做收参/幂等键/出参） ---------------- */
+
+function idemKey(req, action, scheduleId) {
+  const key = req.get('Idempotency-Key') || req.body.idempotencyKey;
+  return key ? 'schedule:' + action + ':' + (scheduleId || 'new') + ':' + key : null;
+}
+
+function runHandler(res, next, promise) {
+  promise
+    .then((result) => res.status(result.status).json(result.body))
+    .catch((error) => {
+      if (error instanceof scheduleService.DomainError) {
+        return res.status(error.status).json({
+          error: error.message,
+          code: error.code,
+          ...(error.conflicts ? { conflicts: error.conflicts } : {}),
+          ...(error.unavailable ? { unavailable: error.unavailable } : {}),
+          ...(error.candidates ? { candidates: error.candidates } : {}),
+          ...(error.busyDates ? { busyDates: error.busyDates } : {}),
+          ...(error.slotConflicts ? { slotConflicts: error.slotConflicts } : {})
+        });
+      }
+      next(error);
+    });
+}
+
+// 创建档期草稿
+app.post('/api/tourSchedules', (req, res, next) => {
+  const rawKey = req.get('Idempotency-Key') || req.body.idempotencyKey;
+  const key = rawKey ? 'schedule:create:' + rawKey : null;
+  runHandler(res, next, scheduleService.withIdempotency(key, 'create', null, () =>
+    scheduleService.createDraft(req.body, req.body.actor || '')
+  ));
+});
+
+// 提交前预检：冲突与替换候选（不落锁）
+app.get('/api/tourSchedules/:id/conflicts', (req, res, next) => {
+  try {
+    const result = scheduleService.preview(req.params.id);
+    res.json(result.body);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 提交锁场：按日期+箱位锁定偶头与配件
+app.post('/api/tourSchedules/:id/submit', (req, res, next) => {
+  runHandler(res, next, scheduleService.withIdempotency(
+    idemKey(req, 'submit', req.params.id), 'submit', req.params.id,
+    () => scheduleService.submit(req.params.id, req.body || {}, req.body.actor || '')
+  ));
+});
+
+// 演出前更换任一角色/偶头：旧清单立即失效并按新件重算
+app.post('/api/tourSchedules/:id/swap', (req, res, next) => {
+  runHandler(res, next, scheduleService.withIdempotency(
+    idemKey(req, 'swap', req.params.id), 'swap', req.params.id,
+    () => scheduleService.swap(req.params.id, req.body || {}, req.body.actor || '')
+  ));
+});
+
+// 状态推进（演出待开场由刷新自动派生，也可显式推进 巡演中）
+app.post('/api/tourSchedules/:id/dispatch', (req, res, next) => {
+  runHandler(res, next, scheduleService.withIdempotency(
+    idemKey(req, 'dispatch', req.params.id), 'dispatch', req.params.id,
+    () => scheduleService.transition(req.params.id, '巡演中', req.body.actor || '', req.body.note)
+  ));
+});
+
+// 返场清点（可带缺损/遗失清单）；清点未闭环前锁不释放
+app.post('/api/tourSchedules/:id/checkin', (req, res, next) => {
+  runHandler(res, next, scheduleService.withIdempotency(
+    idemKey(req, 'checkin', req.params.id), 'checkin', req.params.id,
+    () => scheduleService.checkIn(req.params.id, req.body || {}, req.body.actor || '')
+  ));
+});
+
+// 返场清点闭环：释放占用，相关偶头才能进入下一档期
+app.post('/api/tourSchedules/:id/close', (req, res, next) => {
+  runHandler(res, next, scheduleService.withIdempotency(
+    idemKey(req, 'close', req.params.id), 'close', req.params.id,
+    () => scheduleService.closeOut(req.params.id, req.body || {}, req.body.actor || '')
+  ));
+});
+
+// 单场履历：清单版本 + 全部事件（提交/换角/清点/闭环）
+app.get('/api/tourSchedules/:id/manifest', (req, res, next) => {
+  try {
+    const schedule = store.getSchedule(req.params.id);
+    if (!schedule) return res.status(404).json({ error: 'not found' });
+    res.json({
+      schedule: scheduleService.scheduleView(schedule),
+      activeLocks: store.getActiveLocks(req.params.id),
+      timeline: store.getTimeline(req.params.id).events
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/* ---------------- 占用查询入口：列表与单件状态同一判断来源 ---------------- */
+
+function occupancyContext() {
+  const activeLocks = store.getAllActiveLocks();
+  const statusById = new Map(
+    db.listRecords('tourSchedules').map((s) => [s.id, state.deriveStatus(s)])
+  );
+  return { activeLocks, statusById };
+}
+
+// 偶头/配件占用列表（支持 ?itemType=head&date=YYYY-MM-DD）
+app.get('/api/occupancy/:itemType', (req, res, next) => {
+  try {
+    const itemType = req.params.itemType === 'head' ? 'puppetHeads'
+      : req.params.itemType === 'accessory' ? 'accessories' : null;
+    if (!itemType) return res.status(400).json({ error: 'itemType 需为 head 或 accessory' });
+    const { activeLocks, statusById } = occupancyContext();
+    let locks = activeLocks;
+    if (req.query.date) locks = locks.filter((l) => l.showDate === req.query.date);
+    const result = db.listRecords(itemType).map((record) => {
+      const occ = state.itemOccupancy(record.id, locks, statusById);
+      return {
+        id: record.id,
+        name: record.name || record.role,
+        role: record.role,
+        play: record.play,
+        boxNo: record.boxNo,
+        recordStatus: record.status,
+        occupancy: occ.status,
+        blockers: occ.blockers
+      };
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 单件当前占用状态 + 档期履历（刷新前后一致；未闭环时显示返场未闭环）
+app.get('/api/occupancy/:itemType/:id', (req, res, next) => {
+  try {
+    const itemType = req.params.itemType === 'head' ? 'puppetHeads'
+      : req.params.itemType === 'accessory' ? 'accessories' : null;
+    if (!itemType) return res.status(400).json({ error: 'itemType 需为 head 或 accessory' });
+    const record = db.getRecord(itemType, req.params.id);
+    if (!record) return res.status(404).json({ error: 'not found' });
+    const { activeLocks, statusById } = occupancyContext();
+    res.json({
+      item: record,
+      occupancy: state.itemOccupancy(record.id, activeLocks, statusById),
+      scheduleHistory: store.getItemLockHistory(req.params.id)
+    });
   } catch (error) {
     next(error);
   }
@@ -358,6 +362,8 @@ app.use((error, req, res, next) => {
   res.status(error.status || 500).json({ error: error.message || 'server error' });
 });
 
-app.listen(PORT, () => {
-  console.log(config.title + ' API running at http://localhost:' + PORT);
+db.init().then(() => {
+  app.listen(PORT, () => {
+    console.log(config.title + ' API running at http://localhost:' + PORT);
+  });
 });

@@ -32,6 +32,13 @@ module.exports = {
       required: ['showName', 'venue', 'play', 'headIds', 'accessoryIds'],
       titleFields: ['showName', 'play']
     },
+    tourSchedules: {
+      label: '巡演档期',
+      defaultStatus: '草稿',
+      statuses: ['草稿', '已锁档', '演出待开场', '巡演中', '返场清点中', '已闭环'],
+      required: ['showName', 'venue', 'play', 'showDates', 'boxNo'],
+      titleFields: ['showName', 'play']
+    },
     lossReports: {
       label: '缺损追踪',
       defaultStatus: '待处理',
@@ -70,7 +77,11 @@ module.exports = {
   ],
   examples: [
     'GET /api/puppetHeads?play=火焰山&status=可演出 查询某剧目可用偶头',
-    'POST /api/tourBoxes 创建巡演装箱单',
+    'POST /api/tourSchedules 创建巡演档期草稿',
+    'POST /api/tourSchedules/:id/submit 提交锁场（按日期与箱位占用偶头配件）',
+    'POST /api/tourSchedules/:id/swap 演出前换角，旧清单失效重算',
+    'POST /api/tourSchedules/:id/checkin 返场清点，/close 闭环后释放占用',
+    'GET /api/occupancy/head/:id 查询单件占用状态与档期履历',
     'POST /api/lossReports 登记返场缺损或遗失'
   ]
 };
